@@ -265,50 +265,47 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   }
   renderSetup();
 
-  // ---------- Sound ----------
-  // Play through the silent switch: mark the page as media playback and keep a silent <audio> running.
-  let ac, silentEl;
-  function silentWavUrl() {
-    const n = 8000, buf = new ArrayBuffer(44 + n), v = new DataView(buf);
-    const w = (o, t) => [...t].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
-    w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt ');
-    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-    v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
-    w(36, 'data'); v.setUint32(40, n, true);
-    for (let i = 0; i < n; i++) v.setUint8(44 + i, 128);
-    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  // ---------- Audio track ----------
+  // The whole workout is rendered into one audio file and played by an <audio> element.
+  // Media playback ignores the silent switch and keeps running while the iPhone is locked.
+  // The track's playback position is the clock for the display.
+  const SR = 8000;
+  function tone(buf, t0, freq, len, vol = 0.8) {
+    const s0 = Math.floor(t0 * SR), n = Math.floor(len * SR);
+    for (let i = 0; i < n && s0 + i < buf.length; i++) {
+      const t = i / SR;
+      const env = Math.min(1, t / 0.008) * Math.min(1, (len - t) / 0.04);
+      const v = Math.sin(2 * Math.PI * freq * t) * 0.75 + Math.sin(4 * Math.PI * freq * t) * 0.25;
+      buf[s0 + i] = Math.max(-1, Math.min(1, buf[s0 + i] + v * env * vol));
+    }
   }
-  function unlockAudio() {
-    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
-    try {
-      if (!silentEl) { silentEl = new Audio(silentWavUrl()); silentEl.loop = true; silentEl.setAttribute('playsinline', ''); }
-      silentEl.play().catch(() => {});
-    } catch (e) {}
-    try {
-      ac = ac || new (window.AudioContext || window.webkitAudioContext)();
-      ac.resume && ac.resume();
-    } catch (e) {}
-  }
-  function stopSilent() { try { silentEl && silentEl.pause(); } catch (e) {} }
-  function beep(freq = 880, len = 0.15, when = 0, vol = 0.35) {
-    if (!ac) return;
-    const t = ac.currentTime + when;
-    const o = ac.createOscillator(), g = ac.createGain();
-    o.type = 'square'; o.frequency.value = freq;
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + len);
-    o.connect(g).connect(ac.destination); o.start(t); o.stop(t + len + 0.02);
-  }
-  const sounds = {
-    tick: () => beep(660, 0.12),
-    work: () => beep(1046, 0.45, 0, 0.45),
-    rest: () => { beep(784, 0.15); beep(587, 0.25, 0.18); },
-    round: () => { beep(587, 0.15); beep(784, 0.15, 0.18); beep(587, 0.3, 0.36); },
-    done: () => { [784, 988, 1175, 1568].forEach((f, i) => beep(f, 0.22, i * 0.16, 0.4)); },
+  const SOUNDS = {
+    work: (b, t) => tone(b, t, 1046, 0.5),
+    rest: (b, t) => { tone(b, t, 784, 0.16); tone(b, t + 0.2, 587, 0.3); },
+    round: (b, t) => { tone(b, t, 587, 0.16); tone(b, t + 0.2, 784, 0.16); tone(b, t + 0.4, 587, 0.32); },
+    done: (b, t) => [784, 988, 1175, 1568].forEach((f, i) => tone(b, t + i * 0.17, f, i === 3 ? 0.5 : 0.22)),
   };
+  function renderTrack(p, total) {
+    const len = total + 2;
+    const buf = new Float32Array(Math.ceil(len * SR));
+    p.forEach((s, i) => { if (i > 0 && SOUNDS[s.type]) SOUNDS[s.type](buf, s.start); });
+    SOUNDS.done(buf, total);
+    const n = buf.length, ab = new ArrayBuffer(44 + n * 2), v = new DataView(ab);
+    const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, SR, true); v.setUint32(28, SR * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, 'data'); v.setUint32(40, n * 2, true);
+    const pcm = new Int16Array(ab, 44, n);
+    for (let i = 0; i < n; i++) pcm[i] = buf[i] * 32767;
+    return URL.createObjectURL(new Blob([ab], { type: 'audio/wav' }));
+  }
+  const player = new Audio();
+  player.setAttribute('playsinline', '');
+  player.preload = 'auto';
+  let trackUrl = null;
 
-  // ---------- Wake lock (native + video fallback for iOS home-screen apps) ----------
+  // ---------- Keep the screen on ----------
   let lock = null;
   const keepVid = document.createElement('video');
   keepVid.setAttribute('playsinline', ''); keepVid.setAttribute('muted', '');
@@ -325,12 +322,12 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     try { lock && lock.release(); } catch (e) {} lock = null;
   }
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && running) { keepAwake(); if (ac && ac.resume) ac.resume(); }
+    if (document.visibilityState === 'visible' && running) { keepAwake(); tick(); }
   });
 
   // ---------- Timer ----------
   const LABEL = { prep: 'Bereit machen', work: 'Übung', rest: 'Pause', round: 'Rundenpause' };
-  let plan = [], idx = 0, phaseEnd = 0, pausedLeft = null, running = false, raf = 0, lastSec = null, startedAt = 0;
+  let plan = [], total = 0, idx = -1, running = false, raf = 0, startedAt = 0;
   const runEl = $('run');
 
   function show(view) {
@@ -347,94 +344,108 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     if (n.type === 'round') return `Danach: Rundenpause ${mmss(n.dur)}`;
     return '';
   }
+  const phaseName = s => s.type === 'work' ? `Übung ${s.ex}` : LABEL[s.type];
 
-  function enter(i, announce = true) {
-    idx = i; lastSec = null;
+  function enter(i) {
+    idx = i;
     const s = plan[i];
     runEl.className = s.type;
-    $('phase').textContent = s.type === 'work' ? `Übung ${s.ex}` : LABEL[s.type];
+    $('phase').textContent = player.paused ? 'Pausiert' : phaseName(s);
     $('rRound').innerHTML = `${s.round}<em>/${cfg.rounds}</em>`;
     $('rEx').innerHTML = `${s.ex}<em>/${cfg.exercises}</em>`;
     $('next').textContent = nextText(i);
-    if (announce && sounds[s.type]) sounds[s.type]();
+    if ('mediaSession' in navigator) {
+      try { navigator.mediaSession.metadata = new MediaMetadata({ title: phaseName(s), artist: `Zirkel Timer · Runde ${s.round}/${cfg.rounds}`, artwork: [{ src: 'icon-512.png', sizes: '512x512', type: 'image/png' }] }); } catch (e) {}
+    }
   }
 
-  function remainingTotal(curLeft) {
-    let t = curLeft;
-    for (let j = idx + 1; j < plan.length; j++) t += plan[j].dur;
-    return t;
-  }
-  const grandTotal = () => plan.reduce((a, s) => a + s.dur, 0);
-
-  function draw(left) {
-    const s = plan[idx];
+  function draw(t) {
+    let i = plan.findIndex(s => t < s.start + s.dur);
+    if (i < 0) i = plan.length - 1;
+    if (i !== idx) enter(i);
+    const s = plan[i];
+    const left = Math.max(0, s.start + s.dur - t);
     const secs = Math.ceil(left - 1e-6);
-    $('clock').textContent = secs >= 60 ? mmss(secs) : Math.max(0, secs);
+    $('clock').textContent = secs >= 60 ? mmss(secs) : secs;
     $('phaseBar').style.width = (100 * (1 - left / s.dur)).toFixed(2) + '%';
-    const rem = remainingTotal(left), tot = grandTotal();
+    const rem = Math.max(0, total - t);
     $('left').textContent = mmss(rem);
-    const pct = 100 * (1 - rem / tot);
+    const pct = 100 * (1 - rem / total);
     $('totalBar').style.width = pct.toFixed(2) + '%';
     $('pct').textContent = Math.floor(pct) + ' %';
-    runEl.classList.toggle('last3', secs <= 3 && secs > 0 && pausedLeft === null);
-    if (secs !== lastSec) {
-      lastSec = secs;
-    }
+    runEl.classList.toggle('last3', secs <= 3 && secs > 0 && !player.paused);
   }
 
-  function loop() {
+  function tick() {
     if (!running) return;
-    const now = performance.now();
-    let left = (phaseEnd - now) / 1000;
-    if (left <= 0) {
-      let i = idx;
-      while (left <= 0 && i + 1 < plan.length) { i++; phaseEnd += plan[i].dur * 1000; left = (phaseEnd - now) / 1000; }
-      if (left <= 0) return finish();
-      enter(i);
-    }
-    draw(left);
+    const t = player.currentTime;
+    if (t >= total) return finish();
+    draw(t);
+  }
+  function loop() {
+    cancelAnimationFrame(raf);
+    if (!running) return;
+    tick();
     raf = requestAnimationFrame(loop);
   }
 
+  function buildTimed() {
+    const p = buildPlan();
+    let t = 0;
+    p.forEach(s => { s.start = t; t += s.dur; });
+    return [p, t];
+  }
+
   function start() {
-    unlockAudio();
-    beep(1, 0.01, 0, 0.0002);
-    plan = buildPlan();
-    pausedLeft = null; running = true; startedAt = Date.now();
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    [plan, total] = buildTimed();
+    if (trackUrl) URL.revokeObjectURL(trackUrl);
+    trackUrl = renderTrack(plan, total);
+    player.src = trackUrl;
+    player.currentTime = 0;
+    const pr = player.play();
+    if (pr && pr.catch) pr.catch(() => {});
+    running = true; startedAt = Date.now(); idx = -1;
     $('pauseBtn').textContent = 'Pause';
     disarmStop();
     show('run');
-    enter(0, false);
-    phaseEnd = performance.now() + plan[0].dur * 1000;
+    draw(0);
     keepAwake();
     loop();
   }
 
   function togglePause() {
     if (!running) return;
-    if (pausedLeft === null) {
-      pausedLeft = Math.max(0, (phaseEnd - performance.now()) / 1000);
-      cancelAnimationFrame(raf);
-      $('pauseBtn').textContent = 'Weiter';
-      $('phase').textContent = 'Pausiert';
-      draw(pausedLeft);
-    } else {
-      unlockAudio(); keepAwake();
-      phaseEnd = performance.now() + pausedLeft * 1000;
-      pausedLeft = null;
-      $('pauseBtn').textContent = 'Pause';
-      const s = plan[idx];
-      $('phase').textContent = s.type === 'work' ? `Übung ${s.ex}` : LABEL[s.type];
-      loop();
-    }
+    if (player.paused) { player.play().catch(() => {}); keepAwake(); }
+    else player.pause();
   }
+  player.addEventListener('pause', () => {
+    if (!running) return;
+    $('pauseBtn').textContent = 'Weiter';
+    $('phase').textContent = 'Pausiert';
+    runEl.classList.remove('last3');
+  });
+  player.addEventListener('play', () => {
+    if (!running) return;
+    $('pauseBtn').textContent = 'Pause';
+    if (idx >= 0) $('phase').textContent = phaseName(plan[idx]);
+  });
+  player.addEventListener('ended', () => { if (running) finish(); });
 
   function skip() {
     if (!running) return;
-    if (idx + 1 >= plan.length) return finish();
-    enter(idx + 1);
-    if (pausedLeft !== null) { pausedLeft = plan[idx].dur; draw(pausedLeft); }
-    else phaseEnd = performance.now() + plan[idx].dur * 1000;
+    const i = idx < 0 ? 0 : idx;
+    if (i + 1 >= plan.length) return finish();
+    player.currentTime = plan[i + 1].start;
+    draw(plan[i + 1].start);
+  }
+
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.setActionHandler('play', () => { player.play().catch(() => {}); });
+      navigator.mediaSession.setActionHandler('pause', () => player.pause());
+      navigator.mediaSession.setActionHandler('nexttrack', skip);
+    } catch (e) {}
   }
 
   let armTimer;
@@ -446,14 +457,17 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
       armTimer = setTimeout(disarmStop, 2500);
       return;
     }
-    disarmStop(); halt(); show('setup');
+    disarmStop(); halt(true); show('setup');
   }
 
-  function halt() { running = false; cancelAnimationFrame(raf); releaseAwake(); setTimeout(stopSilent, 2500); }
+  function halt(silence) {
+    running = false; cancelAnimationFrame(raf); releaseAwake();
+    if (silence) player.pause();
+  }
 
   function finish() {
-    halt();
-    sounds.done();
+    if (!running) return;
+    halt(false); // let the closing fanfare play out
     const mins = Math.round((Date.now() - startedAt) / 60000);
     $('doneText').textContent = `${cfg.rounds} ${cfg.rounds === 1 ? 'Runde' : 'Runden'} × ${cfg.exercises} Übungen · ${mins} min`;
     show('done');
@@ -463,7 +477,7 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   $('pauseBtn').addEventListener('click', togglePause);
   $('skipBtn').addEventListener('click', skip);
   $('stopBtn').addEventListener('click', stopTap);
-  $('backBtn').addEventListener('click', () => show('setup'));
+  $('backBtn').addEventListener('click', () => { player.pause(); show('setup'); });
 })();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
