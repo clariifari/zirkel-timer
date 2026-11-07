@@ -205,15 +205,16 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     { key: 'rest', label: 'Pause', hint: 'zwischen den Übungen', min: 0, max: 300, step: 1, unit: 's' },
     { key: 'rounds', label: 'Runden', hint: 'Durchgänge', min: 1, max: 20, step: 1, unit: '' },
     { key: 'roundRest', label: 'Rundenpause', hint: 'zwischen den Runden', min: 0, max: 600, step: 1, unit: 's' },
+    { key: 'lag', label: 'Ton-Ausgleich', hint: 'falls der Ton nach der Anzeige kommt', min: 0, max: 2, step: 0.1, unit: 'lag' },
   ];
-  const DEFAULTS = { exercises: 8, work: 40, rest: 20, rounds: 3, roundRest: 60 };
+  const DEFAULTS = { exercises: 8, work: 40, rest: 20, rounds: 3, roundRest: 60, lag: 1.0 };
   let cfg = { ...DEFAULTS };
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('zirkel-cfg') || '{}')); } catch (e) {}
   const save = () => { try { localStorage.setItem('zirkel-cfg', JSON.stringify(cfg)); } catch (e) {} };
 
   const $ = id => document.getElementById(id);
   const mmss = s => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
-  const fmtVal = (f, v) => f.unit === 's'
+  const fmtVal = (f, v) => f.unit === 'lag' ? `${v.toFixed(1)}<small>s</small>` : f.unit === 's'
     ? (v >= 60 ? `${mmss(v)}<small>min</small>` : `${v}<small>s</small>`)
     : `${v}`;
 
@@ -233,7 +234,7 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
       let n = 0;
       const bump = () => {
         const mult = f.unit === 's' && n > 12 ? 5 : 1;
-        cfg[f.key] = Math.min(f.max, Math.max(f.min, cfg[f.key] + d * f.step * mult));
+        cfg[f.key] = Math.round(Math.min(f.max, Math.max(f.min, cfg[f.key] + d * f.step * mult)) * 10) / 10;
         renderSetup(); save();
       };
       let t1, t2;
@@ -280,15 +281,21 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     }
   }
   const SOUNDS = {
-    work: (b, t) => tone(b, t, 1046, 0.5),
-    rest: (b, t) => { tone(b, t, 784, 0.16); tone(b, t + 0.2, 587, 0.3); },
-    round: (b, t) => { tone(b, t, 587, 0.16); tone(b, t + 0.2, 784, 0.16); tone(b, t + 0.4, 587, 0.32); },
+    count: (b, t) => tone(b, t, 880, 0.12, 0.7),                                   // 3-2-1 vor Ende der Pause
+    work: (b, t) => tone(b, t, 1318, 0.7, 0.85),                                    // hoch und lang: los geht's
+    rest: (b, t) => { tone(b, t, 523, 0.22); tone(b, t + 0.26, 392, 0.4); },        // tief, fallend: Pause
+    round: (b, t) => { tone(b, t, 523, 0.18); tone(b, t + 0.22, 440, 0.18); tone(b, t + 0.44, 349, 0.45); },
     done: (b, t) => [784, 988, 1175, 1568].forEach((f, i) => tone(b, t + i * 0.17, f, i === 3 ? 0.5 : 0.22)),
   };
   function renderTrack(p, total) {
     const len = total + 2;
     const buf = new Float32Array(Math.ceil(len * SR));
-    p.forEach((s, i) => { if (i > 0 && SOUNDS[s.type]) SOUNDS[s.type](buf, s.start); });
+    p.forEach((s, i) => {
+      if (i > 0 && SOUNDS[s.type]) SOUNDS[s.type](buf, s.start);
+      if (s.type === 'work' && i > 0 && p[i - 1].type !== 'work') {
+        for (let k = 1; k <= 3; k++) if (s.start - k >= p[i - 1].start + 0.3) SOUNDS.count(buf, s.start - k);
+      }
+    });
     SOUNDS.done(buf, total);
     const n = buf.length, ab = new ArrayBuffer(44 + n * 2), v = new DataView(ab);
     const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
@@ -327,7 +334,8 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 
   // ---------- Timer ----------
   const LABEL = { prep: 'Bereit machen', work: 'Übung', rest: 'Pause', round: 'Rundenpause' };
-  let plan = [], total = 0, idx = -1, running = false, raf = 0, startedAt = 0;
+  let plan = [], total = 0, idx = -1, running = false, raf = 0, startedAt = 0, floorT = 0;
+  const now = () => Math.max(floorT, player.currentTime - (cfg.lag || 0));
   const runEl = $('run');
 
   function show(view) {
@@ -364,11 +372,11 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     if (i < 0) i = plan.length - 1;
     if (i !== idx) enter(i);
     const s = plan[i];
-    const left = Math.max(0, s.start + s.dur - t);
+    const left = Math.min(s.dur, Math.max(0, s.start + s.dur - t));
     const secs = Math.ceil(left - 1e-6);
     $('clock').textContent = secs >= 60 ? mmss(secs) : secs;
     $('phaseBar').style.width = (100 * (1 - left / s.dur)).toFixed(2) + '%';
-    const rem = Math.max(0, total - t);
+    const rem = Math.min(total, Math.max(0, total - t));
     $('left').textContent = mmss(rem);
     const pct = 100 * (1 - rem / total);
     $('totalBar').style.width = pct.toFixed(2) + '%';
@@ -378,7 +386,7 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 
   function tick() {
     if (!running) return;
-    const t = player.currentTime;
+    const t = now();
     if (t >= total) return finish();
     draw(t);
   }
@@ -405,7 +413,7 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     player.currentTime = 0;
     const pr = player.play();
     if (pr && pr.catch) pr.catch(() => {});
-    running = true; startedAt = Date.now(); idx = -1;
+    running = true; startedAt = Date.now(); idx = -1; floorT = 0;
     $('pauseBtn').textContent = 'Pause';
     disarmStop();
     show('run');
@@ -436,8 +444,9 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     if (!running) return;
     const i = idx < 0 ? 0 : idx;
     if (i + 1 >= plan.length) return finish();
-    player.currentTime = plan[i + 1].start;
-    draw(plan[i + 1].start);
+    floorT = plan[i + 1].start;
+    player.currentTime = Math.max(0, plan[i + 1].start - 0.05);
+    draw(floorT);
   }
 
   if ('mediaSession' in navigator) {
