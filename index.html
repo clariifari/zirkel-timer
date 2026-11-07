@@ -205,16 +205,15 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     { key: 'rest', label: 'Pause', hint: 'zwischen den Übungen', min: 0, max: 300, step: 1, unit: 's' },
     { key: 'rounds', label: 'Runden', hint: 'Durchgänge', min: 1, max: 20, step: 1, unit: '' },
     { key: 'roundRest', label: 'Rundenpause', hint: 'zwischen den Runden', min: 0, max: 600, step: 1, unit: 's' },
-    { key: 'lag', label: 'Ton-Ausgleich', hint: 'falls der Ton nach der Anzeige kommt', min: 0, max: 2, step: 0.1, unit: 'lag' },
   ];
-  const DEFAULTS = { exercises: 8, work: 40, rest: 20, rounds: 3, roundRest: 60, lag: 1.0 };
+  const DEFAULTS = { exercises: 8, work: 40, rest: 20, rounds: 3, roundRest: 60 };
   let cfg = { ...DEFAULTS };
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('zirkel-cfg') || '{}')); } catch (e) {}
   const save = () => { try { localStorage.setItem('zirkel-cfg', JSON.stringify(cfg)); } catch (e) {} };
 
   const $ = id => document.getElementById(id);
   const mmss = s => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
-  const fmtVal = (f, v) => f.unit === 'lag' ? `${v.toFixed(1)}<small>s</small>` : f.unit === 's'
+  const fmtVal = (f, v) => f.unit === 's'
     ? (v >= 60 ? `${mmss(v)}<small>min</small>` : `${v}<small>s</small>`)
     : `${v}`;
 
@@ -266,51 +265,37 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   }
   renderSetup();
 
-  // ---------- Audio track ----------
-  // The whole workout is rendered into one audio file and played by an <audio> element.
-  // Media playback ignores the silent switch and keeps running while the iPhone is locked.
-  // The track's playback position is the clock for the display.
-  const SR = 8000;
-  function tone(buf, t0, freq, len, vol = 0.8) {
-    const s0 = Math.floor(t0 * SR), n = Math.floor(len * SR);
-    for (let i = 0; i < n && s0 + i < buf.length; i++) {
-      const t = i / SR;
-      const env = Math.min(1, t / 0.008) * Math.min(1, (len - t) / 0.04);
-      const v = Math.sin(2 * Math.PI * freq * t) * 0.75 + Math.sin(4 * Math.PI * freq * t) * 0.25;
-      buf[s0 + i] = Math.max(-1, Math.min(1, buf[s0 + i] + v * env * vol));
-    }
+  // ---------- Sound ----------
+  // Web Audio mixes with other apps (Spotify keeps playing). iOS mutes this kind of sound in silent mode.
+  let ac = null;
+  function initAudio() {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'ambient'; } catch (e) {}
+    try {
+      ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+      if (ac.state !== 'running') ac.resume();
+    } catch (e) {}
   }
-  const SOUNDS = {
-    count: (b, t) => tone(b, t, 880, 0.12, 0.7),                                   // 3-2-1 vor Ende der Pause
-    work: (b, t) => tone(b, t, 1318, 0.7, 0.85),                                    // hoch und lang: los geht's
-    rest: (b, t) => { tone(b, t, 523, 0.22); tone(b, t + 0.26, 392, 0.4); },        // tief, fallend: Pause
-    round: (b, t) => { tone(b, t, 523, 0.18); tone(b, t + 0.22, 440, 0.18); tone(b, t + 0.44, 349, 0.45); },
-    done: (b, t) => [784, 988, 1175, 1568].forEach((f, i) => tone(b, t + i * 0.17, f, i === 3 ? 0.5 : 0.22)),
+  function tone(freq, len, when = 0, vol = 0.5) {
+    if (!ac) return;
+    const t = ac.currentTime + 0.01 + when;
+    const o = ac.createOscillator(), o2 = ac.createOscillator(), g = ac.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    o2.type = 'sine'; o2.frequency.value = freq * 2;
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.008);
+    g.gain.setValueAtTime(vol, t + Math.max(0.01, len - 0.05));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + len);
+    o.connect(g); o2.connect(g2).connect(g); g.connect(ac.destination);
+    o.start(t); o2.start(t); o.stop(t + len + 0.02); o2.stop(t + len + 0.02);
+  }
+  const sounds = {
+    count: () => tone(880, 0.12, 0, 0.45),                                          // 3-2-1 vor Ende der Pause
+    work: () => tone(1318, 0.7, 0, 0.6),                                             // hoch und lang: los geht's
+    rest: () => { tone(523, 0.22); tone(392, 0.4, 0.26); },                          // tief, fallend: Pause
+    round: () => { tone(523, 0.18); tone(440, 0.18, 0.22); tone(349, 0.45, 0.44); }, // drei fallende Töne
+    done: () => [784, 988, 1175, 1568].forEach((f, i) => tone(f, i === 3 ? 0.5 : 0.22, i * 0.17, 0.5)),
   };
-  function renderTrack(p, total) {
-    const len = total + 2;
-    const buf = new Float32Array(Math.ceil(len * SR));
-    p.forEach((s, i) => {
-      if (i > 0 && SOUNDS[s.type]) SOUNDS[s.type](buf, s.start);
-      if (s.type === 'work' && i > 0 && p[i - 1].type !== 'work') {
-        for (let k = 1; k <= 3; k++) if (s.start - k >= p[i - 1].start + 0.3) SOUNDS.count(buf, s.start - k);
-      }
-    });
-    SOUNDS.done(buf, total);
-    const n = buf.length, ab = new ArrayBuffer(44 + n * 2), v = new DataView(ab);
-    const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
-    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
-    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-    v.setUint32(24, SR, true); v.setUint32(28, SR * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-    w(36, 'data'); v.setUint32(40, n * 2, true);
-    const pcm = new Int16Array(ab, 44, n);
-    for (let i = 0; i < n; i++) pcm[i] = buf[i] * 32767;
-    return URL.createObjectURL(new Blob([ab], { type: 'audio/wav' }));
-  }
-  const player = new Audio();
-  player.setAttribute('playsinline', '');
-  player.preload = 'auto';
-  let trackUrl = null;
 
   // ---------- Keep the screen on ----------
   let lock = null;
@@ -329,13 +314,13 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     try { lock && lock.release(); } catch (e) {} lock = null;
   }
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && running) { keepAwake(); tick(); }
+    if (document.visibilityState === 'visible' && running) { keepAwake(); initAudio(); }
   });
+  document.addEventListener('touchend', () => { if (running) initAudio(); }, { passive: true });
 
   // ---------- Timer ----------
   const LABEL = { prep: 'Bereit machen', work: 'Übung', rest: 'Pause', round: 'Rundenpause' };
-  let plan = [], total = 0, idx = -1, running = false, raf = 0, startedAt = 0, floorT = 0;
-  const now = () => Math.max(floorT, player.currentTime - (cfg.lag || 0));
+  let plan = [], idx = 0, phaseEnd = 0, pausedLeft = null, running = false, raf = 0, lastSec = null, startedAt = 0;
   const runEl = $('run');
 
   function show(view) {
@@ -354,107 +339,95 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   }
   const phaseName = s => s.type === 'work' ? `Übung ${s.ex}` : LABEL[s.type];
 
-  function enter(i) {
-    idx = i;
+  function enter(i, announce = true) {
+    idx = i; lastSec = null;
     const s = plan[i];
     runEl.className = s.type;
-    $('phase').textContent = player.paused ? 'Pausiert' : phaseName(s);
+    $('phase').textContent = phaseName(s);
     $('rRound').innerHTML = `${s.round}<em>/${cfg.rounds}</em>`;
     $('rEx').innerHTML = `${s.ex}<em>/${cfg.exercises}</em>`;
     $('next').textContent = nextText(i);
-    if ('mediaSession' in navigator) {
-      try { navigator.mediaSession.metadata = new MediaMetadata({ title: phaseName(s), artist: `Zirkel Timer · Runde ${s.round}/${cfg.rounds}`, artwork: [{ src: 'icon-512.png', sizes: '512x512', type: 'image/png' }] }); } catch (e) {}
+    if (announce && sounds[s.type]) sounds[s.type]();
+  }
+
+  function remainingTotal(curLeft) {
+    let t = curLeft;
+    for (let j = idx + 1; j < plan.length; j++) t += plan[j].dur;
+    return t;
+  }
+  const grandTotal = () => plan.reduce((a, s) => a + s.dur, 0);
+
+  function draw(left) {
+    const s = plan[idx];
+    const secs = Math.ceil(left - 1e-6);
+    $('clock').textContent = secs >= 60 ? mmss(secs) : Math.max(0, secs);
+    $('phaseBar').style.width = (100 * (1 - left / s.dur)).toFixed(2) + '%';
+    const rem = remainingTotal(left), tot = grandTotal();
+    $('left').textContent = mmss(rem);
+    const pct = 100 * (1 - rem / tot);
+    $('totalBar').style.width = pct.toFixed(2) + '%';
+    $('pct').textContent = Math.floor(pct) + ' %';
+    runEl.classList.toggle('last3', secs <= 3 && secs > 0 && pausedLeft === null);
+    if (secs !== lastSec) {
+      // 3-2-1 nur am Ende von Pausen, damit man weiß: gleich geht's weiter
+      const nextIsWork = plan[idx + 1] && plan[idx + 1].type === 'work';
+      if (lastSec !== null && s.type !== 'work' && nextIsWork && secs <= 3 && secs > 0 && pausedLeft === null) sounds.count();
+      lastSec = secs;
     }
   }
 
-  function draw(t) {
-    let i = plan.findIndex(s => t < s.start + s.dur);
-    if (i < 0) i = plan.length - 1;
-    if (i !== idx) enter(i);
-    const s = plan[i];
-    const left = Math.min(s.dur, Math.max(0, s.start + s.dur - t));
-    const secs = Math.ceil(left - 1e-6);
-    $('clock').textContent = secs >= 60 ? mmss(secs) : secs;
-    $('phaseBar').style.width = (100 * (1 - left / s.dur)).toFixed(2) + '%';
-    const rem = Math.min(total, Math.max(0, total - t));
-    $('left').textContent = mmss(rem);
-    const pct = 100 * (1 - rem / total);
-    $('totalBar').style.width = pct.toFixed(2) + '%';
-    $('pct').textContent = Math.floor(pct) + ' %';
-    runEl.classList.toggle('last3', secs <= 3 && secs > 0 && !player.paused);
-  }
-
-  function tick() {
-    if (!running) return;
-    const t = now();
-    if (t >= total) return finish();
-    draw(t);
-  }
   function loop() {
-    cancelAnimationFrame(raf);
     if (!running) return;
-    tick();
+    const now = performance.now();
+    let left = (phaseEnd - now) / 1000;
+    if (left <= 0) {
+      let i = idx;
+      while (left <= 0 && i + 1 < plan.length) { i++; phaseEnd += plan[i].dur * 1000; left = (phaseEnd - now) / 1000; }
+      if (left <= 0) return finish();
+      enter(i);
+    }
+    draw(left);
     raf = requestAnimationFrame(loop);
   }
 
-  function buildTimed() {
-    const p = buildPlan();
-    let t = 0;
-    p.forEach(s => { s.start = t; t += s.dur; });
-    return [p, t];
-  }
-
   function start() {
-    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
-    [plan, total] = buildTimed();
-    if (trackUrl) URL.revokeObjectURL(trackUrl);
-    trackUrl = renderTrack(plan, total);
-    player.src = trackUrl;
-    player.currentTime = 0;
-    const pr = player.play();
-    if (pr && pr.catch) pr.catch(() => {});
-    running = true; startedAt = Date.now(); idx = -1; floorT = 0;
+    initAudio();
+    tone(1, 0.01, 0, 0.0002); // wakes the audio output on iOS
+    plan = buildPlan();
+    pausedLeft = null; running = true; startedAt = Date.now();
     $('pauseBtn').textContent = 'Pause';
     disarmStop();
     show('run');
-    draw(0);
+    enter(0, false);
+    phaseEnd = performance.now() + plan[0].dur * 1000;
     keepAwake();
     loop();
   }
 
   function togglePause() {
     if (!running) return;
-    if (player.paused) { player.play().catch(() => {}); keepAwake(); }
-    else player.pause();
+    if (pausedLeft === null) {
+      pausedLeft = Math.max(0, (phaseEnd - performance.now()) / 1000);
+      cancelAnimationFrame(raf);
+      $('pauseBtn').textContent = 'Weiter';
+      $('phase').textContent = 'Pausiert';
+      draw(pausedLeft);
+    } else {
+      initAudio(); keepAwake();
+      phaseEnd = performance.now() + pausedLeft * 1000;
+      pausedLeft = null;
+      $('pauseBtn').textContent = 'Pause';
+      $('phase').textContent = phaseName(plan[idx]);
+      loop();
+    }
   }
-  player.addEventListener('pause', () => {
-    if (!running) return;
-    $('pauseBtn').textContent = 'Weiter';
-    $('phase').textContent = 'Pausiert';
-    runEl.classList.remove('last3');
-  });
-  player.addEventListener('play', () => {
-    if (!running) return;
-    $('pauseBtn').textContent = 'Pause';
-    if (idx >= 0) $('phase').textContent = phaseName(plan[idx]);
-  });
-  player.addEventListener('ended', () => { if (running) finish(); });
 
   function skip() {
     if (!running) return;
-    const i = idx < 0 ? 0 : idx;
-    if (i + 1 >= plan.length) return finish();
-    floorT = plan[i + 1].start;
-    player.currentTime = Math.max(0, plan[i + 1].start - 0.05);
-    draw(floorT);
-  }
-
-  if ('mediaSession' in navigator) {
-    try {
-      navigator.mediaSession.setActionHandler('play', () => { player.play().catch(() => {}); });
-      navigator.mediaSession.setActionHandler('pause', () => player.pause());
-      navigator.mediaSession.setActionHandler('nexttrack', skip);
-    } catch (e) {}
+    if (idx + 1 >= plan.length) return finish();
+    enter(idx + 1);
+    if (pausedLeft !== null) { pausedLeft = plan[idx].dur; draw(pausedLeft); }
+    else phaseEnd = performance.now() + plan[idx].dur * 1000;
   }
 
   let armTimer;
@@ -466,17 +439,14 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
       armTimer = setTimeout(disarmStop, 2500);
       return;
     }
-    disarmStop(); halt(true); show('setup');
+    disarmStop(); halt(); show('setup');
   }
 
-  function halt(silence) {
-    running = false; cancelAnimationFrame(raf); releaseAwake();
-    if (silence) player.pause();
-  }
+  function halt() { running = false; cancelAnimationFrame(raf); releaseAwake(); }
 
   function finish() {
-    if (!running) return;
-    halt(false); // let the closing fanfare play out
+    halt();
+    sounds.done();
     const mins = Math.round((Date.now() - startedAt) / 60000);
     $('doneText').textContent = `${cfg.rounds} ${cfg.rounds === 1 ? 'Runde' : 'Runden'} × ${cfg.exercises} Übungen · ${mins} min`;
     show('done');
@@ -486,7 +456,7 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   $('pauseBtn').addEventListener('click', togglePause);
   $('skipBtn').addEventListener('click', skip);
   $('stopBtn').addEventListener('click', stopTap);
-  $('backBtn').addEventListener('click', () => { player.pause(); show('setup'); });
+  $('backBtn').addEventListener('click', () => show('setup'));
 })();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
