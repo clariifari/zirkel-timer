@@ -266,7 +266,30 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   renderSetup();
 
   // ---------- Sound ----------
-  let ac;
+  // Play through the silent switch: mark the page as media playback and keep a silent <audio> running.
+  let ac, silentEl;
+  function silentWavUrl() {
+    const n = 8000, buf = new ArrayBuffer(44 + n), v = new DataView(buf);
+    const w = (o, t) => [...t].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+    w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+    w(36, 'data'); v.setUint32(40, n, true);
+    for (let i = 0; i < n; i++) v.setUint8(44 + i, 128);
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+  function unlockAudio() {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    try {
+      if (!silentEl) { silentEl = new Audio(silentWavUrl()); silentEl.loop = true; silentEl.setAttribute('playsinline', ''); }
+      silentEl.play().catch(() => {});
+    } catch (e) {}
+    try {
+      ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+      ac.resume && ac.resume();
+    } catch (e) {}
+  }
+  function stopSilent() { try { silentEl && silentEl.pause(); } catch (e) {} }
   function beep(freq = 880, len = 0.15, when = 0, vol = 0.35) {
     if (!ac) return;
     const t = ac.currentTime + when;
@@ -285,13 +308,25 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     done: () => { [784, 988, 1175, 1568].forEach((f, i) => beep(f, 0.22, i * 0.16, 0.4)); },
   };
 
-  // ---------- Wake lock ----------
+  // ---------- Wake lock (native + video fallback for iOS home-screen apps) ----------
   let lock = null;
+  const keepVid = document.createElement('video');
+  keepVid.setAttribute('playsinline', ''); keepVid.setAttribute('muted', '');
+  keepVid.muted = true; keepVid.loop = true;
+  keepVid.src = 'data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMpbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAB9AAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAlN0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAB9AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAABAAAAAQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAfQAAAAAAABAAAAAAHLbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAgABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABdm1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAATZzdGJsAAAAtnN0c2QAAAAAAAAAAQAAAKZhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAABAAEABIAAAASAAAAAAAAAABFUxhdmM2MC4zMS4xMDIgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALGF2Y0MBQsAK/+EAFWdCwAraewEQAAADABAAAAMAIPEiagEABGjOD8gAAAAQcGFzcAAAAAEAAAABAAAAFGJ0cnQAAAAAAAAKOAAACjgAAAAYc3R0cwAAAAAAAAABAAAAAgAAQAAAAAAUc3RzcwAAAAAAAAABAAAAAQAAABxzdHNjAAAAAAAAAAEAAAABAAAAAgAAAAEAAAAcc3RzegAAAAAAAAAAAAAAAgAAAoUAAAAJAAAAFHN0Y28AAAAAAAAAAQAAA1kAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjYwLjE2LjEwMAAAAAhmcmVlAAAClm1kYXQAAAJvBgX//2vcRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY0IHIzMTA4IDMxZTE5ZjkgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDIzIC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MCByZWY9MSBkZWJsb2NrPTE6MDowIGFuYWx5c2U9MHgxOjB4MTExIG1lPWhleCBzdWJtZT0yIHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTAgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0wIDh4OGRjdD0wIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFfcXBfb2Zmc2V0PTAgdGhyZWFkcz0xIGxvb2thaGVhZF90aHJlYWRzPTEgc2xpY2VkX3RocmVhZHM9MCBucj0wIGRlY2ltYXRlPTEgaW50ZXJsYWNlZD0wIGJsdXJheV9jb21wYXQ9MCBjb25zdHJhaW5lZF9pbnRyYT0wIGJmcmFtZXM9MCB3ZWlnaHRwPTAga2V5aW50PTI1MCBrZXlpbnRfbWluPTEgc2NlbmVjdXQ9NDAgaW50cmFfcmVmcmVzaD0wIHJjX2xvb2thaGVhZD0xMCByYz1jcmYgbWJ0cmVlPTEgY3JmPTIzLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgYXE9MToxLjAwAIAAAAAOZYiEBb///w9FAAFPf4AAAAAFQZogFfU=';
+  keepVid.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;left:0;top:0';
+  document.body.appendChild(keepVid);
   async function keepAwake() {
+    try { keepVid.play().catch(() => {}); } catch (e) {}
     try { if ('wakeLock' in navigator && !lock) { lock = await navigator.wakeLock.request('screen'); lock.addEventListener('release', () => { lock = null; }); } } catch (e) {}
   }
-  function releaseAwake() { try { lock && lock.release(); } catch (e) {} lock = null; }
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && running) keepAwake(); });
+  function releaseAwake() {
+    try { keepVid.pause(); } catch (e) {}
+    try { lock && lock.release(); } catch (e) {} lock = null;
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && running) { keepAwake(); if (ac && ac.resume) ac.resume(); }
+  });
 
   // ---------- Timer ----------
   const LABEL = { prep: 'Bereit machen', work: 'Übung', rest: 'Pause', round: 'Rundenpause' };
@@ -362,11 +397,8 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   }
 
   function start() {
-    try {
-      ac = ac || new (window.AudioContext || window.webkitAudioContext)();
-      ac.resume && ac.resume();
-      beep(1, 0.01, 0, 0.0002); // unlock audio on iOS
-    } catch (e) {}
+    unlockAudio();
+    beep(1, 0.01, 0, 0.0002);
     plan = buildPlan();
     pausedLeft = null; running = true; startedAt = Date.now();
     $('pauseBtn').textContent = 'Pause';
@@ -387,6 +419,7 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
       $('phase').textContent = 'Pausiert';
       draw(pausedLeft);
     } else {
+      unlockAudio(); keepAwake();
       phaseEnd = performance.now() + pausedLeft * 1000;
       pausedLeft = null;
       $('pauseBtn').textContent = 'Pause';
@@ -416,7 +449,7 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     disarmStop(); halt(); show('setup');
   }
 
-  function halt() { running = false; cancelAnimationFrame(raf); releaseAwake(); }
+  function halt() { running = false; cancelAnimationFrame(raf); releaseAwake(); setTimeout(stopSilent, 2500); }
 
   function finish() {
     halt();
